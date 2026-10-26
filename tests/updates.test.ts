@@ -1,0 +1,166 @@
+import { existsSync } from 'node:fs'
+import { join } from 'node:path'
+import { describe, expect, it } from 'vitest'
+import {
+  compareVersions,
+  detachedRelaunchEnv,
+  evaluateUpdate,
+  findGitRoot,
+  isPullNoOp,
+  resolveSourceRepoRoot,
+  spawnStepOptions,
+  updateCapabilities
+} from '../src/main/updates'
+
+describe('update installation routes', () => {
+  it('never offers Squirrel or git updating for an unsigned packaged Mac', () => {
+    expect(updateCapabilities(true, 'darwin')).toEqual({ autoUpdateSupported: false, sourceUpdateSupported: false })
+  })
+  it('retains packaged Windows/Linux and source-checkout updating', () => {
+    for (const platform of ['win32', 'linux'] as const) {
+      expect(updateCapabilities(true, platform)).toEqual({ autoUpdateSupported: true, sourceUpdateSupported: false })
+    }
+    expect(updateCapabilities(false, 'darwin')).toEqual({ autoUpdateSupported: false, sourceUpdateSupported: true })
+  })
+})
+
+describe('findGitRoot', () => {
+  it('walks up from a nested directory to the repo root', () => {
+    const root = findGitRoot(join(process.cwd(), 'out', 'main'))
+    expect(root).toBe(process.cwd())
+    expect(existsSync(join(root!, '.git'))).toBe(true)
+  })
+
+  it('returns null when no git directory exists above the start path', () => {
+    expect(findGitRoot('/tmp')).toBeNull()
+  })
+})
+
+describe('resolveSourceRepoRoot', () => {
+  it('finds the cutawan checkout from the workspace cwd', () => {
+    expect(resolveSourceRepoRoot()).toBe(process.cwd())
+  })
+})
+
+describe('compareVersions', () => {
+  it('orders dotted versions numerically', () => {
+    expect(compareVersions('0.2.0', '0.1.0')).toBeGreaterThan(0)
+    expect(compareVersions('0.1.0', '0.2.0')).toBeLessThan(0)
+    expect(compareVersions('1.0.0', '1.0.0')).toBe(0)
+    // Numeric, not lexicographic: 0.10 > 0.9.
+    expect(compareVersions('0.10.0', '0.9.9')).toBeGreaterThan(0)
+  })
+
+  it('ignores the v prefix and pre-release suffixes', () => {
+    expect(compareVersions('v1.2.3', '1.2.3')).toBe(0)
+    expect(compareVersions('1.2.3-beta.1', '1.2.3')).toBe(0)
+  })
+
+  it('treats missing segments as zero', () => {
+    expect(compareVersions('1.2', '1.2.0')).toBe(0)
+    expect(compareVersions('1.2.1', '1.2')).toBeGreaterThan(0)
+  })
+})
+
+describe('spawnStepOptions', () => {
+  it('enables shell for npm on Windows (CVE-2024-27980)', () => {
+    if (process.platform !== 'win32') return
+    expect(spawnStepOptions('npm', process.cwd()).shell).toBe(true)
+    expect(spawnStepOptions('npm.cmd', process.cwd()).shell).toBe(true)
+    expect(spawnStepOptions('git', process.cwd()).shell).toBeUndefined()
+  })
+
+  it('does not force shell on Unix', () => {
+    if (process.platform === 'win32') return
+    expect(spawnStepOptions('npm', process.cwd()).shell).toBeUndefined()
+    expect(spawnStepOptions('git', process.cwd()).shell).toBeUndefined()
+  })
+})
+
+describe('isPullNoOp', () => {
+  it('detects the no-op pull in both git phrasings', () => {
+    expect(isPullNoOp('Already up to date.\n')).toBe(true)
+    expect(isPullNoOp('Already up-to-date.\n')).toBe(true) // older git
+  })
+
+  it('treats a fast-forward as a real update', () => {
+    expect(
+      isPullNoOp('Updating 83111f8..abc1234\nFast-forward\n package.json | 2 +-\n')
+    ).toBe(false)
+  })
+})
+
+describe('detachedRelaunchEnv', () => {
+  it('drops the dev-server URL so the relaunch loads the rebuilt renderer', () => {
+    const env = detachedRelaunchEnv({
+      ELECTRON_RENDERER_URL: 'http://localhost:5173',
+      PATH: '/usr/bin'
+    })
+    expect(env).not.toBeNull()
+    expect(env!.ELECTRON_RENDERER_URL).toBeUndefined()
+    // Everything else has to survive, or the new process loses its toolchain.
+    expect(env!.PATH).toBe('/usr/bin')
+  })
+
+  it('leaves the original environment untouched', () => {
+    const original = { ELECTRON_RENDERER_URL: 'http://localhost:5173' }
+    detachedRelaunchEnv(original)
+    expect(original.ELECTRON_RENDERER_URL).toBe('http://localhost:5173')
+  })
+
+  it('returns null outside a dev-server session, where app.relaunch works', () => {
+    expect(detachedRelaunchEnv({ PATH: '/usr/bin' })).toBeNull()
+  })
+})
+
+describe('evaluateUpdate', () => {
+  it('flags an update when the release is newer', () => {
+    const res = evaluateUpdate('0.1.0', {
+      tag_name: 'v0.2.0',
+      html_url: 'https://github.com/x/y/releases/tag/v0.2.0'
+    })
+    expect(res.updateAvailable).toBe(true)
+    expect(res.latestVersion).toBe('0.2.0')
+    expect(res.releaseUrl).toBe('https://github.com/x/y/releases/tag/v0.2.0')
+    expect(res.error).toBeNull()
+  })
+
+  it('carries the published release notes, never a draft\'s', () => {
+    expect(evaluateUpdate('0.1.0', { tag_name: 'v0.2.0', body: '### Added\n\n- Timeline cuts\n' }).releaseNotes)
+      .toBe('### Added\n\n- Timeline cuts')
+    expect(evaluateUpdate('0.1.0', { tag_name: 'v0.2.0', body: 'secret', draft: true }).releaseNotes).toBeNull()
+    expect(evaluateUpdate('0.1.0', { tag_name: 'v0.2.0', body: '   ' }).releaseNotes).toBeNull()
+  })
+
+  it('reports up to date when the release matches or is older', () => {
+    expect(evaluateUpdate('0.2.0', { tag_name: 'v0.2.0' }).updateAvailable).toBe(false)
+    expect(evaluateUpdate('0.3.0', { tag_name: 'v0.2.0' }).updateAvailable).toBe(false)
+  })
+
+  it('handles a repo with no releases', () => {
+    const res = evaluateUpdate('0.1.0', null)
+    expect(res.updateAvailable).toBe(false)
+    expect(res.latestVersion).toBeNull()
+    expect(res.releaseUrl).toBeNull()
+  })
+
+  it('carries the update capability flags through', () => {
+    const release = { tag_name: 'v0.2.0' }
+    expect(evaluateUpdate('0.1.0', release, true).autoUpdateSupported).toBe(true)
+    expect(evaluateUpdate('0.1.0', release, false).autoUpdateSupported).toBe(false)
+    expect(evaluateUpdate('0.1.0', release, false, true).sourceUpdateSupported).toBe(true)
+    // Bare defaults: no self-update paths in the pure evaluator.
+    const bare = evaluateUpdate('0.1.0', release)
+    expect(bare.autoUpdateSupported).toBe(false)
+    expect(bare.sourceUpdateSupported).toBe(false)
+  })
+
+  it('ignores drafts and pre-releases', () => {
+    expect(
+      evaluateUpdate('0.1.0', { tag_name: 'v9.9.9', draft: true }).updateAvailable
+    ).toBe(false)
+    expect(
+      evaluateUpdate('0.1.0', { tag_name: 'v9.9.9', prerelease: true }).updateAvailable
+    ).toBe(false)
+  })
+})

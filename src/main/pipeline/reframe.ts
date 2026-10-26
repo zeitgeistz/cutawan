@@ -1,0 +1,146 @@
+import type { Clip, Project } from '@shared/types'
+import { mergeReframeResult, needsReframe } from '@shared/reframe'
+import { loadProject, updateProject } from '../projects'
+import { getAnalysisCredential, getModelPreferences } from '../settings'
+import { analyzeClipLayout } from './clipLayout'
+import { LayoutMemory } from './layoutMemory'
+
+/**
+ * On-demand reframe analysis for clips the pipeline left 'pending' (see
+ * shared/reframe.ts). Called when a clip is opened in the editor and, as a
+ * guard, before a clip is exported.
+ */
+
+interface Run {
+  promise: Promise<Project>
+  controller: AbortController
+  retryLayout: boolean
+  /** Callers still interested in the result; the run aborts only when none are left. */
+  waiters: number
+}
+
+const inFlight = new Map<string, Run>()
+
+/**
+ * Run the reframe analysis for one clip if it has not run yet, persist the
+ * result and return the fresh project. A no-op (returning the current
+ * project) when the clip is already analysed or no longer exists.
+ *
+ * Concurrent calls for the same clip share one analysis. Each caller's
+ * signal governs only its own interest: an aborted caller stops waiting at
+ * once, but the shared run itself is cancelled only when every caller has
+ * aborted — cancelling an export must not strand an editor that is waiting
+ * on the same clip, and a caller without a signal (the editor) keeps the run
+ * alive.
+ *
+ * Analyses the clip's *current* trim rather than the AI's suggested range,
+ * so a clip the user extended before opening it is tracked end to end.
+ */
+export function ensureClipReframe(
+  projectId: string,
+  clipId: string,
+  signal?: AbortSignal,
+  retryLayout = false
+): Promise<Project> {
+  if (signal?.aborted) return Promise.reject(abortError(signal))
+  const key = `${projectId}:${clipId}`
+  let run = inFlight.get(key)
+  if (run && retryLayout && !run.retryLayout) {
+    // A normal no-op load must not swallow a simultaneous explicit retry.
+    return joinRun(run, signal).then(() => ensureClipReframe(projectId, clipId, signal, true))
+  }
+  if (!run) {
+    const controller = new AbortController()
+    const started: Run = {
+      controller,
+      retryLayout,
+      waiters: 0,
+      promise: analyseAndPersist(projectId, clipId, controller.signal, retryLayout).finally(() =>
+        inFlight.delete(key)
+      )
+    }
+    inFlight.set(key, started)
+    run = started
+  }
+  return joinRun(run, signal)
+}
+
+function abortError(signal: AbortSignal): Error {
+  return signal.reason instanceof Error
+    ? signal.reason
+    : new DOMException('Reframe analysis cancelled', 'AbortError')
+}
+
+function joinRun(run: Run, signal?: AbortSignal): Promise<Project> {
+  if (!signal) {
+    run.waiters++
+    return run.promise
+  }
+  if (signal.aborted) return Promise.reject(abortError(signal))
+  run.waiters++
+  return new Promise<Project>((resolve, reject) => {
+    const onAbort = (): void => {
+      run.waiters--
+      if (run.waiters === 0) run.controller.abort()
+      reject(abortError(signal))
+    }
+    signal.addEventListener('abort', onAbort, { once: true })
+    run.promise.then(
+      (project) => {
+        signal.removeEventListener('abort', onAbort)
+        resolve(project)
+      },
+      (err: unknown) => {
+        signal.removeEventListener('abort', onAbort)
+        reject(err instanceof Error ? err : new Error(String(err)))
+      }
+    )
+  })
+}
+
+async function analyseAndPersist(
+  projectId: string,
+  clipId: string,
+  signal?: AbortSignal,
+  retryLayout = false
+): Promise<Project> {
+  const project = await loadProject(projectId)
+  signal?.throwIfAborted()
+  const clip = project.clips.find((c) => c.id === clipId)
+  if (!clip || (!retryLayout && !needsReframe(clip))) return project
+  if (retryLayout && (clip.edit.layoutChosen || clip.visualLayout?.revision)) {
+    throw new Error('Automatic layout retry cannot replace manually chosen framing or source regions.')
+  }
+  if (project.sourceMissing) {
+    throw new Error(
+      `The source video is missing (${project.video.path}). Relink it before framing this clip.`
+    )
+  }
+
+  // Work on a copy so concurrent manual edits are preserved by the merge.
+  const analysed: Clip = { ...clip, edit: { ...clip.edit } }
+  const apiKey = project.videoType !== 'talking-head' ? getAnalysisCredential() : ''
+  await analyzeClipLayout(project.video.path, analysed, project.videoType,
+    apiKey, getModelPreferences().analysisModel, project.transcript ?? undefined, signal,
+    new LayoutMemory(project.video.path, project.clips))
+  signal?.throwIfAborted()
+
+  if (retryLayout && analysed.reframeAnalysis) {
+    analysed.reframeAnalysis.revision = (clip.reframeAnalysis?.revision ?? 0) + 1
+  }
+
+  const updated = await updateProject(projectId, (fresh) => {
+    const idx = fresh.clips.findIndex((c) => c.id === clipId)
+    // Regenerated away while we were analysing: nothing to attach it to.
+    if (idx === -1) return
+    if (fresh.video.path !== project.video.path ||
+      (fresh.sourceRevision ?? 0) !== (project.sourceRevision ?? 0)) return
+    fresh.clips[idx] = mergeReframeResult(fresh.clips[idx], analysed, fresh.videoType, retryLayout)
+  })
+  signal?.throwIfAborted()
+  const latest = updated.clips.find((c) => c.id === clipId)
+  // A trim extension saved during inference needs another pass before export.
+  return latest && needsReframe(latest)
+    ? analyseAndPersist(projectId, clipId, signal, retryLayout)
+    : updated
+}

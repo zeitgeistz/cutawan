@@ -1,0 +1,137 @@
+name: Release
+
+# Builds installable apps and publishes them to GitHub Releases.
+#
+# Two ways to cut a release of the version in package.json:
+#   1. Push a version tag, e.g. `npm version patch && git push --follow-tags`.
+#   2. Land a commit on main whose message starts with "Release v" (handy when
+#      the environment can't push tags). electron-builder derives the release
+#      tag (vX.Y.Z) from package.json either way.
+#
+# electron-builder builds the .dmg / .exe / .AppImage plus the update
+# manifests (latest*.yml) the in-app updater reads. Unsigned macOS builds use
+# assisted downloads and manual replacement; Windows/Linux support in-app installation.
+#
+# Uses the built-in GITHUB_TOKEN, so no extra secrets are required as long as
+# releases publish to this same repo (see the `publish` block in package.json).
+
+on:
+  push:
+    tags:
+      - 'v*'
+    branches:
+      - main
+  workflow_dispatch: {}
+
+concurrency:
+  group: cutawan-release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    # Only actually build/publish for a tag push, a manual dispatch, or a
+    # "Release v…" commit to main — ordinary main commits skip (a no-op run).
+    if: >-
+      github.event_name != 'push' ||
+      startsWith(github.ref, 'refs/tags/v') ||
+      startsWith(github.event.head_commit.message, 'Release v')
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      # Every release says what changed; fail before spending build time.
+      - name: Check release notes
+        shell: bash
+        run: node scripts/changelog-section.mjs "$(node -p "require('./package.json').version")" --require > /dev/null
+      - run: npm ci
+      - name: Validate packaged Mac before publishing
+        if: runner.os == 'macOS'
+        run: |
+          npm run package:dir -- --arm64
+          bash scripts/check-mac-package.sh
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: false
+      - name: Build installers
+        run: npm run package -- --publish never ${{ runner.os == 'macOS' && '--arm64' || '' }}
+        env:
+          # The app is not code-signed yet: stop electron-builder from hunting
+          # for a Developer ID certificate (and failing) on the macOS runner.
+          CSC_IDENTITY_AUTO_DISCOVERY: false
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: installers-${{ runner.os }}
+          if-no-files-found: error
+          path: |
+            release/*.dmg
+            release/*.zip
+            release/*.exe
+            release/*.AppImage
+            release/*.blockmap
+            release/latest*.yml
+
+  publish:
+    name: publish complete release
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: installers-*
+          path: release
+          merge-multiple: true
+      - name: Verify all platforms and publish together
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/verify-release.mjs release
+          version=$(node -p "require('./package.json').version")
+          node scripts/changelog-section.mjs "$version" --require > notes.md
+          if gh release view "v$version" --json isDraft > release-state.json; then
+            node -e 'if (!require("./release-state.json").isDraft) throw new Error("This version is already published; bump the version before releasing.")'
+          else
+            gh release create "v$version" --draft --target "$GITHUB_SHA" --title "v$version" --notes-file notes.md
+          fi
+          gh release upload "v$version" release/* --clobber
+          # A fresh draft has no public tag yet; resolve it through gh's draft-aware lookup.
+          release_id=$(gh release view "v$version" --json databaseId --jq '.databaseId')
+          gh api "repos/$GITHUB_REPOSITORY/releases/$release_id" > uploaded-release.json
+          node scripts/verify-release.mjs release uploaded-release.json
+          gh release edit "v$version" --target "$GITHUB_SHA" --notes-file notes.md --draft=false --latest
+
+  # After the first listing exists on winget-pkgs (see docs/winget.md), later
+  # releases open an update PR automatically. Skip until the package id is set.
+  winget:
+    name: publish winget
+    needs: publish
+    if: ${{ vars.WINGET_PACKAGE_ID != '' }}
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - id: version
+        shell: bash
+        run: echo "version=$(node -p "require('./package.json').version")" >> $GITHUB_OUTPUT
+      - uses: vedantmgoyal9/winget-releaser@v2
+        with:
+          identifier: ${{ vars.WINGET_PACKAGE_ID }}
+          installers-regex: '\.exe$'
+          token: ${{ secrets.WINGET_TOKEN }}
+          release-tag: v${{ steps.version.outputs.version }}
